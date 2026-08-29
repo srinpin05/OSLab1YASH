@@ -38,7 +38,9 @@ typedef struct{
 } command;
 
 
-//processes a regular command (with file redirection) and returns a command*
+/*processes a regular command (with file redirection) and returns a command*
+command* has file redirection information, background job info, and piping info.*/
+
 command* processCommand(char* input){
     const char a[] = " ";
     char* innerPtr = NULL;
@@ -65,7 +67,7 @@ command* processCommand(char* input){
             //set redirection flag
             redirection = true;
             tokens = strtok_r(NULL, a, &innerPtr);
-            printf("%s \n", tokens);
+            //printf("%s \n", tokens);
             char* filename = tokens;
 
             newcommand->inFilename = filename;
@@ -109,24 +111,52 @@ command* processCommand(char* input){
 }
 
 
-//execute a regular non piping command
-void executeRegularCommand(command* cmd){
-    if (cmd)
+//change STDIN,OUT, and ERROR via dup. NO ACTUAL EXECUTION
+void executeFileRedirection(command* cmd){
+    if (!cmd->used_stdin){
+        int ifd = open(cmd->inFilename, O_RDONLY);
+            
+        //error handling for robustness
+        /*
+        if(ifd == -1){
+            perror("opening error");
+        }
+        */
 
-}
-
-
-//checks if a command has piping or not given input string
-bool isPiping(char* input){
-    command** scmd = processPiping(input);
-
-    int c = 0;
-    while(scmd[c] != NULL){
-        c+=1;
+        dup2(ifd, STDIN_FILENO);
     }
-    if (c==1) {return false;}
-    else {return true;}
+    if (!cmd->used_stdout){
+        int ofd = open(cmd->outFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+        //error handling for robustness
+        /*
+        if(ifd == -1){
+            perror("opening error");
+        }
+        */
+
+        dup2(ofd, STDOUT_FILENO);
+    }
+    if (!cmd->used_stderr){
+        int efd = open(cmd->errFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+        //error handling for robustness
+        /*
+        if(ifd == -1){
+            perror("opening error");
+        }
+        */
+
+        dup2(efd, STDERR_FILENO);
+    }
 }
+
+//executes an actual command using execvp
+void executeRegularCommand(command* cmd){
+    executeFileRedirection(cmd);
+    execvp(cmd->args[0], cmd->args);
+}
+
 //processing/parses the piping command given input string
 command** processPiping(char* input){
     char* outerPtr = NULL;
@@ -137,44 +167,67 @@ command** processPiping(char* input){
     //piping
     while(outertoken!=NULL){
         subcmds[c] = processCommand(outertoken);
-        char* outertoken = strtok_r(NULL, "|", &outerPtr);
+        outertoken = strtok_r(NULL, "|", &outerPtr);
         c++;
     }
     return subcmds;
 }
+
+//checks if a command has piping or not given input string
+bool isPiping(command** scmd){
+
+    int c = 0;
+    while(scmd[c] != NULL){
+        c+=1;
+    }
+    if (c==1) {return false;}
+    else {return true;}
+}
+
 //executes the piping command given array of sub commands. 
 void executePiping(command** cmds){
     int prev_fd = -1;
-        for (int j = 0; cmds[j+1] != NULL; j++){
-            int pipefd[2];
-            if (cmds[j+1] != NULL){
-                pipe(pipefd);
-            }
-            int cpid1 = fork();
-            if (cpid1 == 0){ //child
-                if (prev_fd != -1){//read end of previous child
-                    dup2(prev_fd, STDIN_FILENO);
-                    close(prev_fd);
-                }
-                if (!cmds[j]->used_stderr) {
-                    int efd = open(cmds[j]->errFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    dup2(efd, STDERR_FILENO);
-                }
-                if (!cmds[j]->used_stdout) {
-                    int ofd = open(cmds[j]->outFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    dup2(ofd, STDOUT_FILENO);
-                } 
-                if (!cmds[j]->used_stdin) {
-                    int ifd = open(cmds[j]->inFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    dup2(ifd, STDIN_FILENO);
-                }
-                close(pipefd[0]); //close the unused read end
-                dup2(pipefd[1], STDOUT_FILENO);
-                execvp(cmds[j]->args[0], cmds[j]->args);
-                exit(1);
-            }
-            prev_fd = pipefd[1];
+    int pids[200] = {-1};
+    int num_pids = 0;
+    for (int j = 0; cmds[j] != NULL; j++){
+        int pipefd[2] = {-1, -1};
+        //No need to create pipe for the last command
+        if (cmds[j+1] != NULL){
+            pipe(pipefd);
         }
+        int cpid1 = fork();
+        if (cpid1 == 0){ //child
+            if (prev_fd != -1){//read end of the previous pipe
+                dup2(prev_fd, STDIN_FILENO);
+                close(prev_fd);
+            }
+            if(pipefd[0] != -1){
+                close(pipefd[0]); //close the unused read end of the current pipe
+            }
+            if(cmds[j+1] != NULL){//wire STDOUT of current child to write end of the current pipe
+                dup2(pipefd[1], STDOUT_FILENO);
+                close(pipefd[1]);
+            }
+            executeFileRedirection(cmds[j]);
+            execvp(cmds[j]->args[0], cmds[j]->args);
+            exit(1);
+        }
+        //parent process closing its read and write end copies (read end of the previous pipe and write end of current pipe)
+        if (prev_fd!=-1){
+            close(prev_fd);
+        }
+        if (cmds[j+1] != NULL){
+            close(pipefd[1]);
+        }
+        prev_fd = pipefd[0];
+        pids[num_pids] = cpid1;
+        num_pids++;
+    }
+    //wait for all child processes to finish.
+    for (int i = 0; i<num_pids; i++){
+        int status;
+        waitpid(pids[i], &status, 0);
+    }
 }
 
 //starts the background job
@@ -220,54 +273,19 @@ int main(){
                 input[i] = '\0';
             }
         }
-
-        
-
-        char* outertoken = strtok_r(input, "|", &outerPtr);
-        command** cmds = calloc(sizeof(command*),200);
-        int c = 0;
-
-        //piping
-        while(outertoken!=NULL){
-            cmds[c] = processCommand(outertoken);
-            char* outertoken = strtok_r(NULL, "|", &outerPtr);
-            c++;
-        }
-        int prev_fd = -1;
-        for (int j = 0; cmds[j+1] != NULL; j++){
-            int pipefd[2];
-            if (cmds[j+1] != NULL){
-                pipe(pipefd);
-            }
-            int cpid1 = fork();
-            if (cpid1 == 0){ //child
-                if (prev_fd != -1){//read end of previous child
-                    dup2(prev_fd, STDIN_FILENO);
-                    close(prev_fd);
-                }
-                if (!cmds[j]->used_stderr) {
-                    int efd = open(cmds[j]->errFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    dup2(efd, STDERR_FILENO);
-                }
-                if (!cmds[j]->used_stdout) {
-                    int ofd = open(cmds[j]->outFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    dup2(ofd, STDOUT_FILENO);
-                } 
-                if (!cmds[j]->used_stdin) {
-                    int ifd = open(cmds[j]->inFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    dup2(ifd, STDIN_FILENO);
-                }
-                close(pipefd[0]); //close the unused read end
-                dup2(pipefd[1], STDOUT_FILENO);
-                execvp(cmds[j]->args[0], cmds[j]->args);
+        command** scmd = processPiping(input);
+        if(isPiping(scmd)){
+            executePiping(scmd);
+        } else {
+            command* cmd = scmd[0];
+            int cpid = fork();
+            if (cpid == 0){
+                executeRegularCommand(cmd);
                 exit(1);
             }
-            prev_fd = pipefd[1];
+            int status;
+            waitpid(-1, &status, 0);
         }
-
-
-
+        input = readline("# ");
     }
-
-
 }
