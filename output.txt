@@ -1,0 +1,8 @@
+>
+Makefile
+file.txt
+he.txt
+hello.txt
+main
+main.c
+output.txt
