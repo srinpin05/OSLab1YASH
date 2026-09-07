@@ -39,14 +39,18 @@ typedef struct{
 
 typedef struct {
     bool fg;
-    int status; //i.e. running/stopped (0,1)
+    char* status;
     char* command;
     int pgid;
+    int jobid; 
 } Job;
 
 
 Job* jobStack[200] = {0};
+Job* finishedJobs[200] = {0};
+int amount_of_jobs = 0;
 int current = 0;
+int next_jobID = 1;
 Job* currentForeground = NULL;
 
 /*processes a regular command (with file redirection) and returns a command*
@@ -126,24 +130,10 @@ int executeFileRedirection(command* cmd){
     if (!cmd->used_stdout){
         int ofd = open(cmd->outFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
-        //error handling for robustness
-        /*
-        if(ifd == -1){
-            perror("opening error");
-        }
-        */
-
         dup2(ofd, STDOUT_FILENO);
     }
     if (!cmd->used_stderr){
         int efd = open(cmd->errFilename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-        //error handling for robustness
-        /*
-        if(ifd == -1){
-            perror("opening error");
-        }
-        */
 
         dup2(efd, STDERR_FILENO);
     }
@@ -152,7 +142,7 @@ int executeFileRedirection(command* cmd){
 
 //executes an actual command using execvp
 void executeRegularCommand(command* cmd){
-    //printf("HELLO WORLD");
+
     int b = executeFileRedirection(cmd);
     if (b==-1){
         exit(1);
@@ -173,7 +163,6 @@ command** processInput(char* input){
     command** subcmds = calloc(sizeof(command*),200);
     char* outertoken = strtok_r(input, "|", &outerPtr);
     int c = 0;
-
     //piping
     while(outertoken!=NULL){
         subcmds[c] = processCommand(outertoken);
@@ -181,7 +170,6 @@ command** processInput(char* input){
         c++;
     }
    //----INPUT PARSING----
-
 
     //check if the given input is a background job and append a background job command to the end of the commands list.
     if (bg) {
@@ -200,6 +188,30 @@ int length(command** cmds){
     }
     return c;
 }
+
+void remove_pid(int pid){
+    bool flag = false;
+    for (int j = 0; j<amount_of_jobs; j++){
+        if (jobStack[j]->pgid == pid){
+            flag = true;
+        }
+        if (flag){
+            jobStack[j] = jobStack[j+1];
+        }
+    }
+    amount_of_jobs--; 
+    if (amount_of_jobs==0 && currentForeground != NULL){
+        next_jobID = currentForeground->jobid+1;
+    } else if (amount_of_jobs==0 && currentForeground == NULL){
+        next_jobID = 1;
+    } else {
+        next_jobID = jobStack[amount_of_jobs-1]->jobid+1;
+    }
+}
+
+
+
+
 //checks if a command has piping or not given input string
 bool isPiping(command** scmd){
     int c = 0;
@@ -226,7 +238,6 @@ void executePiping(command** cmds){
         //create a job object and set its fg = true;
 
         if (cpid1 == 0){ //child
-            //printf("HELLO");
             if (prev_fd != -1){//read end of the previous pipe
                 dup2(prev_fd, STDIN_FILENO);
                 close(prev_fd);
@@ -266,83 +277,191 @@ void executePiping(command** cmds){
 }
 
 //starts the background job
-
-void startBackgroundJob(char* inputcmd){
-                            
-
+void printFinishedJobs(){
+    for (int i = current-1; i>=0; i--){
+        printf("[%d] - Done       %s\n",
+        finishedJobs[i]->jobid,
+        finishedJobs[i]->command
+        );
+        free(finishedJobs[i]);
+        finishedJobs[i] = 0;
+        current--;
+    }
 }
 
-void signal_callback_handler(int signum) {
-    printf("Caught signal");
+//continues most recently stopped bg job via "bg" command
+void continue_bg(){
+    if (amount_of_jobs==0){
+        return;
+    }
+    for (int i = amount_of_jobs-1; i>=0; i--){
+        if (strcmp(jobStack[i]->status, "Stopped")==0){
+            jobStack[i]->status = "Running";
+            
+            printf("[%d] %c %s       %s\n", jobStack[i]->jobid, 
+                    amount_of_jobs-i == 1 ? '+' : '-',
+                    jobStack[i]->status, 
+                    jobStack[i]->command);
 
-    //revert to default
-    struct sigaction sb;
-    sb.sa_flags = 0;
-    sigemptyset(&sb.sa_mask);
-    sb.sa_handler = SIG_DFL;
-    sigaction(SIGTSTP, &sb, NULL);
-    //push to background stack
-    jobStack[current] = currentForeground;
-    jobStack[current]->status = 1; //stopped status = 1
-    jobStack[current]->fg = false;
+            kill(-(jobStack[i]->pgid), SIGCONT);
+            break;
+        }
+    }
+}
 
-    //send signal to pgid
-    kill(-currentForeground->pgid, SIGTSTP);
+void bring_to_fg(){
+    if (amount_of_jobs==0){
+        return;
+    }
+    signal(SIGTTOU, SIG_IGN); //required when using tcsetpgrp
+    pid_t shell_pgid = getpgrp(); //get pgid of shell to give control back after fg process finishes
+    
+    currentForeground = jobStack[amount_of_jobs-1]; //set the currentForeground process. 
+    currentForeground->status = "Running";
 
-    //clear the currentForeground
-    currentForeground = NULL;
+    //tcsetpgrp(0, currentForeground->pgid); //set terminal control to current foreground process
+
+    printf("[%d] %c %s       %s\n", currentForeground->jobid, 
+                    '+',
+                    currentForeground->status, 
+                    currentForeground->command);
+    
+    tcsetpgrp(0, currentForeground->pgid);
+    remove_pid(jobStack[amount_of_jobs-1]->pgid);
+    currentForeground->fg = true;
 
 
+    kill(-currentForeground->pgid, SIGCONT);
 
+    int status;
+    pid_t result = waitpid(currentForeground->pgid, &status, WUNTRACED);
+    if(result > 0){
+        if (WIFSTOPPED(status)){//child process was STOPPED not TERMINATED.
+            currentForeground->status="Stopped";
+            jobStack[amount_of_jobs++] = currentForeground;
+            currentForeground->fg = false;
+        }
+    }
+    tcsetpgrp(0, shell_pgid);
+}
+
+void SIGCHLD_handler(int signum, siginfo_t* info, void *context){
+
+    if (info->si_code != CLD_EXITED && info->si_code != CLD_KILLED && info->si_code != CLD_DUMPED){
+        return;
+    }
+
+    bool flag = false;
+    for (int i = 0; jobStack[i] != NULL; i++){
+        if (jobStack[i]->pgid == info->si_pid){
+            flag = true;
+            finishedJobs[current] = jobStack[i];
+            finishedJobs[current]->status = "Done";
+            current++;
+        }
+    }
+    if (flag){
+        remove_pid(info->si_pid);
+    }
 }
 void print_jobs(){
-        for(int i = current-1; i>=0; i--){
-            if(jobStack[i]->status != 2){
-                printf("[%d] %c %s       %s\n", current-i, 
-                        current-i == 1 ? '+' : '-',
-                        jobStack[i]->status==1 ? "Stopped" : "Running", 
-                        jobStack[i]->command);
-            }
+        for(int i = 0; i<amount_of_jobs; i++){
+            printf("[%d] %c %s       %s\n", jobStack[i]->jobid, 
+                    i == amount_of_jobs-1 ? '+' : '-',
+                    jobStack[i]->status, 
+                    jobStack[i]->command);
         }
 }
 int main(){
     //read main input
-    char* input = readline("# ");
-    char* temp_input = strdup(input);
-    char* outerPtr = NULL;
 
+    //handling SIGCHLD
+    struct sigaction sa;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = SIGCHLD_handler;
+    sigaction(SIGCHLD, &sa, NULL);
 
+    signal(SIGTTOU, SIG_IGN);
 
-    while (input){
+    int shell_pgid = getpgrp();
 
+    while (1){
+        char* input = readline("# ");
+        char* temp_input = strdup(input);
         for (int i = 0; i<strlen(input);i++){
             if (input[i] == '\n'){
                 input[i] = '\0';
             }
         }
-
-        command** scmd = processInput(input);
-        if(isPiping(scmd)){
-            //printf("WHY");
-            executePiping(scmd);
+        if (strlen(input) == 0){
+            printFinishedJobs();
+            continue;
+        }
+        else if (strcmp(input, "fg")==0){
+            bring_to_fg();
+            continue;
+        } else if (strcmp(input, "bg") == 0){
+            continue_bg();
+            continue;
+        }
+        else if (strcmp(input, "jobs")==0){
+            print_jobs();
+            continue;
         } else {
-            command* cmd = scmd[0];
-            int cpid = fork();
-            printf("%d", cpid);
-            //background job
-
-            if (cpid == 0){
-                //printf("hello");
-                int indexInTable = current-1;
-                setpgid(0,0); //setpgid
-                executeRegularCommand(cmd);
-                exit(1);
+            // PROCESS/PARSE commands 
+            command** scmd = processInput(input);
+            int j = 0;
+            while (scmd[j+1]!=NULL){j++;}
+            // bg flag to check if current command is a background job
+            bool bg = scmd[j]->isBG;
+            // START execution
+            if(isPiping(scmd)){
+                executePiping(scmd);
             } else {
-                int status;
-                waitpid(-1, &status, 0);
+                command* cmd = scmd[0];
+
+                int cpid = fork();
+                //PARENT CREATES JOB OBJECT AND PUSHES INTO JOB STACK
+                if(cpid != 0){
+                    setpgid(cpid, cpid); //create process group with id=cpid and make the process with id=cpid the head of that group. 
+                    Job* j1 = malloc(sizeof(Job));
+                    j1->pgid = cpid;
+                    j1->status = "RUNNING";
+                    j1->jobid = next_jobID; 
+                    j1->command = temp_input;
+                    if(bg==1){
+                        j1->fg = false;
+                        jobStack[amount_of_jobs++] = j1;
+                    } else {
+                        j1->fg = true;
+                        currentForeground = j1;
+                        tcsetpgrp(0, currentForeground->pgid);
+                    }
+                
+                    next_jobID = j1->jobid+1;
+                    j1 = NULL;
+                }
+                if (cpid == 0){
+                    setpgid(0,0); //setpgid
+                    executeRegularCommand(cmd);
+                    exit(1);
+                } else {
+                    if(!bg){
+                        int status;
+                        pid_t result = waitpid(currentForeground->pgid, &status, WUNTRACED);
+                        if(result > 0){
+                            if (WIFSTOPPED(status)){//child process was STOPPED not TERMINATED.
+                                currentForeground->status="Stopped";
+                                jobStack[amount_of_jobs++] = currentForeground;
+                                currentForeground->fg = false;
+                            }
+                        }
+                        tcsetpgrp(0, shell_pgid);
+                    }
+                }
             }
         }
-
-        input = readline("# ");
+    
     }
 }
