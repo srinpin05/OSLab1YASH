@@ -278,6 +278,7 @@ void executePiping(command** cmds){
 
 //starts the background job
 void printFinishedJobs(){
+    if(current == 0){return;}
     for (int i = current-1; i>=0; i--){
         printf("[%d] - Done       %s\n",
         finishedJobs[i]->jobid,
@@ -383,11 +384,15 @@ int main(){
     sigaction(SIGCHLD, &sa, NULL);
 
     signal(SIGTTOU, SIG_IGN);
-
+    signal(SIGTSTP, SIG_IGN);
     int shell_pgid = getpgrp();
 
     while (1){
         char* input = readline("# ");
+        if (input == NULL){
+            printf("\n");
+            break;
+        }
         char* temp_input = strdup(input);
         for (int i = 0; i<strlen(input);i++){
             if (input[i] == '\n'){
